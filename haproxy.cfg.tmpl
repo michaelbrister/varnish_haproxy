@@ -96,6 +96,22 @@ backend be_drupal
   # Optional overload guard: if >400 conns to this srv, 503 quickly instead of queueing forever
   # http-request deny if { srv_conn(drupal) gt 400 }
 
+  # Clean up response cookies on cacheable HTML ===
+  acl is_html            res.hdr(Content-Type) -m sub -i text/html
+  acl is_cacheable_stat  status 200 301 302 404
+  # Imperva/tracker cookies occasionally appear downstream (or from proxies)
+  acl is_imperva_cookie  res.hdr(Set-Cookie) -m reg -i (visid_incap|nlbi_|incap_ses_)
+  # Drop only the tracker cookies on public/cacheable HTML
+  http-response del-header Set-Cookie if is_html is_cacheable_stat is_imperva_cookie
+
+  # Strip benign request cookies to origin for anon ===
+  acl anon_req  !req.hdr(Authorization) !req.cook(SSESS) !req.cook(SESS) !req.cook(csrf) !req.cook(logged_in)
+  http-request replace-header Cookie "(?i)(^|;\\s*)(visid_incap_[^=]+|nlbi_[^=]+|incap_ses_[^=]+|_ga[^=;]*|_gid|_gcl_au|_fbp|_swb(?:_consent_)?|_ketch[^=;]*)=[^;]*" "\\1" if anon_req
+  http-request replace-header Cookie ";{2,}" ";" if anon_req
+  http-request replace-header Cookie "^(;\\s*)|(\\s*;)$" "" if anon_req
+  acl cookie_empty req.hdr(Cookie) -m str ""
+  http-request del-header Cookie if anon_req cookie_empty
+
 backend be_next
   option http-keep-alive
   http-reuse always
@@ -105,3 +121,17 @@ backend be_next
 
   server next ${NEXT_HOST}:443 ssl verify none sni str(${NEXT_HOST}) alpn h2,http/1.1 proto h2 check maxconn 500 slowstart 3s
   http-response set-header X-Origin-Backend nextjs
+
+  # Clean up response cookies on cacheable HTML ===
+  acl is_html            res.hdr(Content-Type) -m sub -i text/html
+  acl is_cacheable_stat  status 200 301 302 404
+  acl is_imperva_cookie  res.hdr(Set-Cookie) -m reg -i (visid_incap|nlbi_|incap_ses_)
+  http-response del-header Set-Cookie if is_html is_cacheable_stat is_imperva_cookie
+
+  # Strip benign request cookies to origin for anon ===
+  acl anon_req  !req.hdr(Authorization) !req.cook(SSESS) !req.cook(SESS) !req.cook(csrf) !req.cook(logged_in)
+  http-request replace-header Cookie "(?i)(^|;\\s*)(visid_incap_[^=]+|nlbi_[^=]+|incap_ses_[^=]+|_ga[^=;]*|_gid|_gcl_au|_fbp|_swb(?:_consent_)?|_ketch[^=;]*)=[^;]*" "\\1" if anon_req
+  http-request replace-header Cookie ";{2,}" ";" if anon_req
+  http-request replace-header Cookie "^(;\\s*)|(\\s*;)$" "" if anon_req
+  acl cookie_empty req.hdr(Cookie) -m str ""
+  http-request del-header Cookie if anon_req cookie_empty
