@@ -59,6 +59,24 @@ sub vcl_recv {
   if (req.url ~ "/{2,}") { set req.url = regsuball(req.url, "/{2,}", "/"); }
   if (req.url == "" || req.url == "?") { set req.url = "/"; }
 
+  /* --------------------------------------------------------------------------
+     PATCH: strip tracking/benign cookies early for anon GET/HEAD
+     (Imperva & analytics cookies fragment caching; drop them up-front)
+  -------------------------------------------------------------------------- */
+  if (req.method == "GET" || req.method == "HEAD") {
+    if (req.http.Cookie) {
+      set req.http.Cookie = regsuball(
+        req.http.Cookie,
+        "(?i)(^|;\\s*)(visid_incap_[^=]+|nlbi_[^=]+|incap_ses_[^=]+|arrAffinity(?:SameSite)?|_ga(?:_[^=;]+)?|_gid|_gcl_au|_fbp|_swb(?:_consent_)?|_ketch[^=;]*)=[^;]*",
+        ""
+      );
+      set req.http.Cookie = regsuball(req.http.Cookie, "^;\\s*|;\\s*$", "");
+      set req.http.Cookie = regsuball(req.http.Cookie, ";\\s*;+", "; ");
+      if (req.http.Cookie == "") { unset req.http.Cookie; }
+    }
+  }
+  /* ---------------------------------------------------------------------- */
+
   /*
     ============================================================================
     Default backend hint
@@ -211,13 +229,9 @@ sub vcl_recv {
         ============================================================================
       */
       if (std.cache_req_body(1500KB)) {
-        set req.http.X-GQL-Cache = "1";        # <-- ADD: mark that body is buffered & cacheable
-        # keep the original method so the backend still sees POST on a miss
+        set req.http.X-GQL-Cache = "1";        # mark that body is buffered & cacheable
         set req.http.X-Orig-Method = req.method;
-
-        # normalize to avoid variant explosion
         unset req.http.Accept-Encoding;
-
         return (hash);   # jump to vcl_hash
       } else {
         set req.http.X-Why-Pass = "graphql: std.cache_req_body failed";
@@ -412,26 +426,28 @@ sub vcl_backend_fetch {
   ============================================================================ 
 */
 sub vcl_backend_response {
-  /* --- Normalize anon cache-control ---
-     Replace private/no-store from origins for anon traffic. */
-  if (beresp.status == 200 && bereq.http.Cookie !~ "SSESS|session|auth") {
-    unset beresp.http.Cache-Control;
-    set beresp.ttl = 5m;
-    set beresp.http.Cache-Control = "public, max-age=300";
-  }
 
-  /* --- Never cache auth/forbidden/redirects --- */
-  if (beresp.status == 401 || beresp.status == 403) {
-    set beresp.ttl = 0s; set beresp.uncacheable = true; return (deliver);
+  /* --------------------------------------------------------------------------
+     PATCH: shared safety net and SWR-like behavior
+  -------------------------------------------------------------------------- */
+  if (bereq.method == "GET" && beresp.status >= 200 && beresp.status < 600) {
+    if (beresp.ttl <= 0s) { set beresp.ttl = 5m; }
+    set beresp.grace = 10m;
+    set beresp.keep  = 30m;
   }
-  if (beresp.status == 301 || beresp.status == 302 || beresp.status == 308) {
-    set beresp.ttl = 0s; set beresp.uncacheable = true; return (deliver);
+  if (beresp.status == 404) { set beresp.ttl = 5m; }
+  if (beresp.status == 301 || beresp.status == 302 || beresp.status == 308) { set beresp.ttl = 10m; }
+  if (beresp.status >= 500) { set beresp.ttl = 1s; set beresp.grace = 15m; }
+
+  /* Strip Imperva Set-Cookie on cacheable HTML (anon/public pages) */
+  if (bereq.method == "GET"
+      && beresp.http.Content-Type ~ "text/html"
+      && (beresp.status == 200 || beresp.status == 301 || beresp.status == 302 || beresp.status == 404)) {
+    if (beresp.http.Set-Cookie ~ "(?i)(visid_incap|nlbi_|incap_ses_)") {
+      unset beresp.http.Set-Cookie;
+    }
   }
-
-  if (!beresp.http.Cache-Control) { set beresp.http.Cache-Control = "public, max-age=3600"; }
-  set beresp.ttl = 1h;
-
-  set beresp.http.X-Origin-Backend = beresp.backend.name;
+  /* ---------------------------------------------------------------------- */
 
   /*
     ============================================================================
@@ -439,12 +455,11 @@ sub vcl_backend_response {
      Cache anon JSON responses; strip cookies; tidy Vary; tuned TTL/grace/keep. 
     ============================================================================ 
   */
-    if (bereq.backend == drupal
-      && bereq.url ~ "^/graphql/?$"                      // allow optional trailing slash
+  if (bereq.backend == drupal
+      && bereq.url ~ "^/graphql/?$"
       && bereq.method == "POST"
       && beresp.http.Content-Type ~ "(?i)application/(json|graphql)") {
 
-      /* Do NOT cache if origin forbids it or on 5xx */
       if (beresp.http.Cache-Control ~ "(?i)no-store|private"
           || beresp.http.X-GQL-Cacheable == "0"
           || beresp.status >= 500) {
@@ -453,29 +468,22 @@ sub vcl_backend_response {
         return (deliver);
       }
 
-      /* Allow shared caching */
       unset beresp.http.Set-Cookie;
 
-      /* Trim high-cardinality Vary keys */
       if (beresp.http.Vary) {
         set beresp.http.Vary = regsuball(beresp.http.Vary,
           "(?i)(^|,\\s*)(cookie|x-consumer-id)(,\\s*|$)", "\1");
         set beresp.http.Vary = regsub(beresp.http.Vary, "^,\\s*|\\s*,\\s*$", "");
-        if (beresp.http.Vary ~ "^(\\s*,\\s*)+$" || beresp.http.Vary ~ "^\\s*$") {
-          unset beresp.http.Vary;
-        }
+        if (beresp.http.Vary ~ "^(\\s*,\\s*)+$" || beresp.http.Vary ~ "^\\s*$") { unset beresp.http.Vary; }
       }
 
-      /* TTL policy for hot anon GraphQL */
       set beresp.ttl   = 15m;
       set beresp.grace = 10m;
       set beresp.keep  = 30m;
       set beresp.http.Cache-Control = "public, max-age=900";
-
-      /* DEBUG: prove this branch executed (remove later) */
       set beresp.http.X-VCL-Branch = "graphql";
 
-    return (deliver);
+      return (deliver);
   }
 
   /* 
@@ -484,9 +492,7 @@ sub vcl_backend_response {
     Long TTL for fingerprinted assets; no cookies. 
     ============================================================================  
   */
-
   if (bereq.backend == nextjs && bereq.url ~ "^/_next/static/") {
-    /* Don’t cache broken responses (avoid poisoning cache with 4xx/5xx). */
     if (beresp.status >= 400) { set beresp.ttl = 0s; set beresp.uncacheable = true; return (deliver); }
     if (beresp.http.Cache-Control ~ "(?i)(no-store|private)") { set beresp.ttl = 0s; return (deliver); }
     set beresp.ttl = 30d;
@@ -517,19 +523,16 @@ sub vcl_backend_response {
       && beresp.http.Content-Type ~ "text/html"
       && bereq.http.X-HTML-Cacheable == "1") {
 
-    /* Drop cookies & keep Vary lean (shared-cache friendliness) */
     unset beresp.http.Set-Cookie;
     if (beresp.http.Vary) {
       set beresp.http.Vary = regsuball(beresp.http.Vary, "(?i)(^|,\\s*)cookie(,\\s*|$)", "\1");
       if (beresp.http.Vary ~ "^(\\s*,\\s*)+$" || beresp.http.Vary ~ "^\\s*$") { unset beresp.http.Vary; }
     }
 
-    /* Guard: if CSP carries nonces, don’t cache (nonces change per request). */
     if (beresp.http.Content-Security-Policy ~ "nonce-") {
       set beresp.ttl = 0s; set beresp.uncacheable = true; return (deliver);
     }
 
-    /* Final TTLs for cached HTML (balance freshness with performance) */
     set beresp.ttl   = 5m;
     set beresp.grace = 10m;
     set beresp.keep  = 1h;
@@ -604,7 +607,7 @@ sub vcl_backend_response {
     set beresp.ttl = 0s; set beresp.uncacheable = true;
   }
 
-  if (!beresp.http.Cache-Control) { set beresp.http.Cache-Control = "public, max-age=3600"; }
+  if (!beresp.http.Cache-Control) { set beresp.http.Cache-Control = "public, max-age=300"; }
 
   /* 
     ============================================================================
@@ -622,9 +625,15 @@ sub vcl_backend_response {
 /* 
   ============================================================================
   DELIVERY MARKERS (for debugging in headers)
+  Also serve-stale behavior in hit path.
   ============================================================================ 
 */
-sub vcl_hit  { set req.http.X-Cache = "HIT"; }
+sub vcl_hit  {
+  if (obj.ttl >= 0s) { set req.http.X-Cache = "HIT"; return (deliver); }
+  if (obj.grace > 0s) { set req.http.X-Cache = "HIT"; return (deliver); }  # serve stale while revalidating
+  set req.http.X-Cache = "MISS";
+  return (miss);
+}
 sub vcl_miss { set req.http.X-Cache = "MISS"; }
 sub vcl_pass { set req.http.X-Cache = "PASS"; }
 
@@ -674,16 +683,16 @@ sub vcl_deliver {
   if (req.http.X-OAuth-Routed) {
     set resp.http.X-OAuth-Routed = req.http.X-OAuth-Routed;
   }
-  /* Strip headers for security */
+
+  /* Keep X-Cache / X-Cache-Hits visible during tuning; hide others */
   unset resp.http.Server;
   unset resp.http.X-Backend;
-  unset resp.http.X-Cache;
-  unset resp.http.X-Cache-Hits;
+  #unset resp.http.X-Cache;         # keep during tests
+  #unset resp.http.X-Cache-Hits;    # keep during tests
   unset resp.http.X-GraphQL-Cacheable;
   unset resp.http.X-GraphQL-Cache;
   unset resp.http.X-Generator;
   unset resp.http.X-OAuth-Routed;
-  unset resp.http.X-Origin-Backend;
   unset resp.http.X-Powered-By;
   unset resp.http.X-Served-By;
   unset resp.http.Via;
@@ -702,11 +711,6 @@ sub vcl_backend_error {
   set beresp.uncacheable = true;
   set beresp.http.Cache-Control = "no-store";
 
-  /* 
-    ============================================================================
-    Strip headers for security 
-    ============================================================================
-  */
   unset beresp.http.Server;
   unset beresp.http.X-Backend;
   unset beresp.http.X-Bereq-Host;
