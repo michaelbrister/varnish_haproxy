@@ -1,0 +1,719 @@
+vcl 4.1;
+
+import std;
+import bodyaccess;
+
+/* 
+  ============================================================================
+  BACKENDS (via HAProxy)
+  - Two logical backends; HAProxy does the real upstream routing.
+  ============================================================================ 
+*/
+backend drupal {
+  .host = "127.0.0.1";
+  .port = "8081";
+  .connect_timeout        = 5s;
+  .first_byte_timeout     = 60s;
+  .between_bytes_timeout  = 60s;
+}
+
+backend nextjs {
+  .host = "127.0.0.1";
+  .port = "8081";
+  .connect_timeout        = 5s;
+  .first_byte_timeout     = 60s;
+  .between_bytes_timeout  = 60s;
+}
+
+/* 
+  ============================================================================
+  PURGE ACL
+  - Who is allowed to BAN/PURGE via Varnish admin endpoints.
+  ============================================================================ 
+*/
+acl purge {
+  "localhost";
+  "10.0.0.0"/8;
+}
+
+/* 
+  ============================================================================
+  REQUEST PROCESSING
+  ============================================================================ 
+*/
+sub vcl_recv {
+
+  if (req.http.Host) {
+    set req.http.Host = std.tolower(req.http.Host);
+    if (req.http.Host ~ ":[0-9]+$") {
+      set req.http.Host = regsub(req.http.Host, ":[0-9]+$", "");
+    }
+  }
+  
+  /* 
+    ============================================================================
+    Normalize URLs
+    Prevent cache fragmentation due to accidental double slashes/empty path. 
+    ============================================================================  
+  */
+  if (req.url ~ "/{2,}") { set req.url = regsuball(req.url, "/{2,}", "/"); }
+  if (req.url == "" || req.url == "?") { set req.url = "/"; }
+
+  /*
+    ============================================================================
+    Default backend hint
+    Most pages are served by Next.js. 
+    ============================================================================
+  */
+  set req.backend_hint = nextjs;
+
+  /* 
+    ============================================================================
+    Compute path-only
+    Reuse path for routing decisions without query noise. 
+    ============================================================================
+  */
+  set req.http.X-Path = regsub(req.url, "^([^?]*).*$", "\1");
+
+  /* 
+    ============================================================================
+    Health probe
+    Simple uptime/health check route. 
+    ============================================================================
+  */
+  if (req.url == "/healthz") { return (synth(200, "OK")); }
+
+  /* 
+    ============================================================================
+    HEAD→GET for Next static
+    Some edges/origins mishandle HEAD on /_next/static; serve from cached GET. 
+    ============================================================================
+  */
+  if (req.method == "HEAD" && req.url ~ "^/_next/static/") {
+    set req.method = "GET";
+  }
+
+  /*
+    ============================================================================
+    STATIC: Drupal public files & Next.js fingerprinted assets
+    High-TTL, cookie-less caching. Must run BEFORE generic pass rules.
+    ============================================================================
+  */
+  if (req.url ~ "^/sites/default/files/"
+      || req.url ~ "(?i)\\.(?:png|jpe?g|gif|webp|svg|ico|avif|pdf)(?:\\?.*)?$"
+      || req.url ~ "^/_next/static/") {
+
+    /* Route by path (split Drupal vs Next) */
+    if (req.url ~ "^/sites/default/files/") { set req.backend_hint = drupal; }
+    else if (req.url ~ "^/_next/static/")   { set req.backend_hint = nextjs; }
+
+    /*
+      ============================================================================
+      Strip benign cookies
+      Prevent cache fragmentation by analytics/affinity/consent cookies. 
+      ============================================================================  
+    */
+    if (req.http.Cookie) {
+      set req.http.Cookie = regsuball(req.http.Cookie,
+        "(?i)(^|; )(?:ARRAffinity|ARRAffinitySameSite|_ga(?:_[^=;]+)?|_gid|_gcl_au|_fbp|_swb|_ketch[^=;]*)=[^;]*",
+        "");
+      set req.http.Cookie = regsuball(req.http.Cookie, "^; *|; *$", "");
+      set req.http.Cookie = regsuball(req.http.Cookie, ";{2,}", ";");
+      if (req.http.Cookie == "") { unset req.http.Cookie; }
+    }
+
+    /* 
+      ============================================================================
+      Strip unversioned querystrings on static
+      Avoid cache key bloat when query is not a version cache-buster. 
+      ============================================================================  
+    */
+    if (req.url ~ "\\?" && req.url !~ "(?i)[\\?&](v|ver|version|_cb|cb|_)=") {
+      set req.url = regsub(req.url, "^(.*)\\?.*$", "\1");
+      if (req.url == "" || req.url == "?") { set req.url = "/"; }
+    }
+
+    /* Only cache GET/HEAD */
+    if (req.method != "GET" && req.method != "HEAD") { return (pass); }
+
+    return (hash);
+  }
+
+  /* 
+    ============================================================================
+    OAUTH TOKEN
+    Must never be cached; normalize and pass to Drupal. 
+    ============================================================================
+  */
+  if (req.url ~ "^//oauth/token(?:/|\\?|$)" || req.http.X-Path ~ "^/oauth/token/?$") {
+    if (req.url ~ "/{2,}") { set req.url = regsuball(req.url, "/{2,}", "/"); }
+    if (req.url ~ "^/oauth/token/(\\?.*)?$") {
+      set req.url = regsub(req.url, "^/oauth/token/?(\\?.*)?$", "/oauth/token\\1");
+    }
+    set req.backend_hint = drupal;
+    set req.http.X-OAuth-Routed = "1";
+    return (pass);
+  }
+
+  /*
+    ============================================================================
+    GRAPHQL
+    Normalize + cache small JSON/GraphQL POST bodies (anon only). 
+    ============================================================================
+  */
+
+  # Preserve then neutralize X-Consumer-ID so it doesn't fragment cache
+  if (req.http.X-Consumer-ID) {
+    set req.http.X-Consumer-ID-Orig = req.http.X-Consumer-ID;
+    unset req.http.X-Consumer-ID;              # keep it out of the hash/variants
+  }
+
+  if (req.url ~ "^//graphql(?:/|\\?|$)" || req.http.X-Path ~ "^/graphql/?$") {
+    if (req.url ~ "/{2,}") { set req.url = regsuball(req.url, "/{2,}", "/"); }
+    if (req.url ~ "^/graphql/(\\?.*)?$") {
+      set req.url = regsub(req.url, "^/graphql/?(\\?.*)?$", "/graphql\\1");
+    }
+    set req.backend_hint = drupal;
+
+    /* Auth/session → PASS (private) */
+    if (req.http.Cookie ~ "(^|; )S?ESS"
+        || req.http.Cookie ~ "(^|; )csrf"
+        || req.http.Cookie ~ "(^|; )logged_in"
+        || req.http.Authorization) {
+      set req.http.X-Why-Pass = "graphql: auth/session";
+      return (pass);
+    }
+
+    /* 
+      ============================================================================
+      Strip benign cookies for anon (avoid Vary: Cookie) 
+      ============================================================================
+    */
+    if (req.http.Cookie) {
+      set req.http.X-Stripped-Cookies = req.http.Cookie;
+      unset req.http.Cookie;
+    }
+
+    /* 
+      ============================================================================
+      Cache POSTs with JSON/GraphQL body by hashing the body 
+      ============================================================================
+    */
+    if (req.method == "POST" && req.http.Content-Type ~ "(?i)application/(json|graphql)(;|$)") {
+      /* Optional size guard */
+      if (std.integer(req.http.Content-Length, 0) > 1500000) {
+        return (synth(413, "The request body size exceeds the limit"));
+      }
+
+      /* 
+        ============================================================================
+        Buffer the request body; returns true if successful 
+        ============================================================================
+      */
+      if (std.cache_req_body(1500KB)) {
+        set req.http.X-GQL-Cache = "1";        # <-- ADD: mark that body is buffered & cacheable
+        # keep the original method so the backend still sees POST on a miss
+        set req.http.X-Orig-Method = req.method;
+
+        # normalize to avoid variant explosion
+        unset req.http.Accept-Encoding;
+
+        return (hash);   # jump to vcl_hash
+      } else {
+        set req.http.X-Why-Pass = "graphql: std.cache_req_body failed";
+        return (pass);
+      }
+    }
+
+    /* 
+      ============================================================================
+      Non-POST/unsupported content-type → PASS 
+      ============================================================================
+    */
+    set req.http.X-Why-Pass = "graphql: not cacheable method/ctype";
+    return (pass);
+  }
+
+  /* 
+    ============================================================================
+    Admin/Login
+    Never cache authenticated/sensitive areas. 
+    ============================================================================
+  */
+  if (req.http.X-Path ~ "^/(user|admin)(?:/|$)") {
+    set req.backend_hint = drupal;
+    return (pass);
+  }
+
+  /* 
+    ============================================================================
+    Forwarded headers pin
+    Keep proto stable; don't stomp X-Forwarded-Host if upstream set it.
+    If missing, derive from Origin; else fall back to Host. 
+    ============================================================================
+  */
+  if (!req.http.X-Forwarded-Proto) {
+    set req.http.X-Forwarded-Proto = "https";
+  }
+
+  if (!req.http.X-Forwarded-Host) {
+    if (req.http.Origin) {
+      set req.http.X-Forwarded-Host = regsub(req.http.Origin, "^https?://([^/:]+).*$", "\1");
+    } else {
+      set req.http.X-Forwarded-Host = req.http.Host;
+    }
+  }
+
+  /* 
+    ============================================================================
+    BAN / PURGE endpoints
+    Allow safe, controlled cache invalidation. 
+    ============================================================================
+  */
+  if (req.method == "BAN" && client.ip ~ purge) {
+    if (req.http.X-Ban-Regex) { ban(req.http.X-Ban-Regex); }
+    return (synth(200, "Banned"));
+  }
+  if (req.method == "PURGE" && client.ip ~ purge) { return (purge); }
+
+  /* 
+    ============================================================================
+    Global auth/cookie passes
+    Don’t cache requests with evidence of personalization. 
+    ============================================================================
+  */
+  if (req.http.Authorization) { return (pass); }
+  if ( req.http.Cookie ~ "(^|; )S?ESS"
+       || req.http.Cookie ~ "(^|; )csrf"
+       || req.url ~ "^/status.php$"
+       || req.url ~ "^/update.php$"
+       || req.url ~ "^/cron.php$"
+       || req.url ~ "^/flag/.*$"
+       || req.url ~ "^.*/ajax/.*$"
+       || req.url ~ "^.*/ahah/.*$" ) {
+    return (pass);
+  }
+
+  /* 
+    ============================================================================
+    Only cache GET/HEAD by default
+  */
+  if (req.method != "GET" && req.method != "HEAD") { return (pass); }
+
+  /* 
+    ============================================================================
+    Next.js image optimizer & /api
+    Usually dynamic—bypass cache. 
+    ============================================================================
+  */
+  if (req.url ~ "^/_next/image" || req.url ~ "^/api/") {
+    set req.backend_hint = nextjs;
+    return (pass);
+  }
+
+  /* 
+    ============================================================================
+    Drupal core/theme/module assets
+    Fingerprinted assets → cache with version-aware stripping. 
+    ============================================================================
+  */
+  if (req.url ~ "^/(core|modules|profiles|themes)/") {
+    set req.backend_hint = drupal;
+    unset req.http.Cookie;
+    if (req.url ~ "(?i)\\.(?:css|js|map|png|jpe?g|gif|webp|svg|ico|avif|woff2?|ttf|eot|pdf|txt|xml)(?:\\?.*)?$") {
+      if (req.url ~ "\\?" && req.url !~ "(?i)[\\?&](v|ver|_cb|cb|version|_)=|\\b\\d{8,}\\b") {
+        set req.url = regsub(req.url, "^(.*)\\?.*$", "\1");
+        if (req.url == "" || req.url == "?") { set req.url = "/"; }
+      }
+      return (hash);
+    } else {
+      return (pass);
+    }
+  }
+
+  /* 
+    ============================================================================
+    PUBLIC HTML WHITELIST
+    Cache anonymous HTML for safe, high-traffic sections. 
+    ============================================================================
+  */
+  if (req.method ~ "^(GET|HEAD)$" && !req.http.Authorization) {
+    if (req.url ~ "^/(api|admin|user|login|cart|checkout)/") {
+      return (pass);
+    }
+
+    /* Strip benign cookies (avoid Vary: Cookie) */
+    if (req.http.Cookie) {
+      unset req.http.Cookie;
+    }
+
+    /* Mark request as HTML-cacheable for backend_response (single switch) */
+    set req.http.X-HTML-Cacheable = "1";
+    set req.backend_hint = nextjs;
+    return (hash);
+  }
+
+  /* 
+    ============================================================================
+    Default: Next.js HTML
+    Not whitelisted → treat as dynamic (will be uncacheable later). 
+    ============================================================================   
+  */
+  set req.backend_hint = nextjs;
+  return (hash);
+}
+
+/* 
+  ============================================================================
+  HASH KEY
+  What defines the cache object identity.
+  ============================================================================ 
+*/
+sub vcl_hash {
+  hash_data(req.url);
+
+  if (req.http.host) { hash_data(req.http.host); }
+  else { hash_data(server.ip); }
+
+  # Distinguish non-GET methods (esp. POST)
+  if (req.method != "GET" && req.method != "HEAD") {
+    hash_data(req.method);
+  }
+
+  # Only add the body if we buffered it in vcl_recv
+  if (req.http.X-GQL-Cache == "1") {
+    bodyaccess.hash_req_body();  // adds buffered body bytes to the hash
+  }
+}
+
+/* 
+  ============================================================================
+  ORIGIN FETCH TWEAKS
+  Set correct Host for HAProxy routing; ensure HTTPS semantics.
+  ============================================================================
+*/
+sub vcl_backend_fetch {
+  # Restore original X-Consumer-ID to the origin if present
+  if (bereq.http.X-Consumer-ID-Orig) {
+    set bereq.http.X-Consumer-ID = bereq.http.X-Consumer-ID-Orig;
+    unset bereq.http.X-Consumer-ID-Orig;
+  }
+
+  /* Preserve method intent for cached POSTs */
+  if (bereq.http.X-GQL-Cache == "1" && bereq.http.X-Orig-Method) {
+    set bereq.method = bereq.http.X-Orig-Method;  # keep POST on a miss
+  }
+}
+
+/* 
+  ============================================================================
+  ORIGIN RESPONSE HANDLER
+  Decide what/how to cache based on backend response.
+  ============================================================================ 
+*/
+sub vcl_backend_response {
+  /* --- Normalize anon cache-control ---
+     Replace private/no-store from origins for anon traffic. */
+  if (beresp.status == 200 && bereq.http.Cookie !~ "SSESS|session|auth") {
+    unset beresp.http.Cache-Control;
+    set beresp.ttl = 5m;
+    set beresp.http.Cache-Control = "public, max-age=300";
+  }
+
+  /* --- Never cache auth/forbidden/redirects --- */
+  if (beresp.status == 401 || beresp.status == 403) {
+    set beresp.ttl = 0s; set beresp.uncacheable = true; return (deliver);
+  }
+  if (beresp.status == 301 || beresp.status == 302 || beresp.status == 308) {
+    set beresp.ttl = 0s; set beresp.uncacheable = true; return (deliver);
+  }
+
+  if (!beresp.http.Cache-Control) { set beresp.http.Cache-Control = "public, max-age=3600"; }
+  set beresp.ttl = 1h;
+
+  set beresp.http.X-Origin-Backend = beresp.backend.name;
+
+  /*
+    ============================================================================
+     GraphQL
+     Cache anon JSON responses; strip cookies; tidy Vary; tuned TTL/grace/keep. 
+    ============================================================================ 
+  */
+    if (bereq.backend == drupal
+      && bereq.url ~ "^/graphql/?$"                      // allow optional trailing slash
+      && bereq.method == "POST"
+      && beresp.http.Content-Type ~ "(?i)application/(json|graphql)") {
+
+      /* Do NOT cache if origin forbids it or on 5xx */
+      if (beresp.http.Cache-Control ~ "(?i)no-store|private"
+          || beresp.http.X-GQL-Cacheable == "0"
+          || beresp.status >= 500) {
+        set beresp.ttl = 0s;
+        set beresp.uncacheable = true;
+        return (deliver);
+      }
+
+      /* Allow shared caching */
+      unset beresp.http.Set-Cookie;
+
+      /* Trim high-cardinality Vary keys */
+      if (beresp.http.Vary) {
+        set beresp.http.Vary = regsuball(beresp.http.Vary,
+          "(?i)(^|,\\s*)(cookie|x-consumer-id)(,\\s*|$)", "\1");
+        set beresp.http.Vary = regsub(beresp.http.Vary, "^,\\s*|\\s*,\\s*$", "");
+        if (beresp.http.Vary ~ "^(\\s*,\\s*)+$" || beresp.http.Vary ~ "^\\s*$") {
+          unset beresp.http.Vary;
+        }
+      }
+
+      /* TTL policy for hot anon GraphQL */
+      set beresp.ttl   = 15m;
+      set beresp.grace = 10m;
+      set beresp.keep  = 30m;
+      set beresp.http.Cache-Control = "public, max-age=900";
+
+      /* DEBUG: prove this branch executed (remove later) */
+      set beresp.http.X-VCL-Branch = "graphql";
+
+    return (deliver);
+  }
+
+  /* 
+    ============================================================================
+    Next STATIC
+    Long TTL for fingerprinted assets; no cookies. 
+    ============================================================================  
+  */
+
+  if (bereq.backend == nextjs && bereq.url ~ "^/_next/static/") {
+    /* Don’t cache broken responses (avoid poisoning cache with 4xx/5xx). */
+    if (beresp.status >= 400) { set beresp.ttl = 0s; set beresp.uncacheable = true; return (deliver); }
+    if (beresp.http.Cache-Control ~ "(?i)(no-store|private)") { set beresp.ttl = 0s; return (deliver); }
+    set beresp.ttl = 30d;
+    set beresp.http.Cache-Control = "public, max-age=2592000";
+    set beresp.do_stream = true;
+    set beresp.do_gzip   = false;
+    unset beresp.http.Set-Cookie;
+    return (deliver);
+  }
+
+  /* 
+    ============================================================================
+    Next image optimizer
+    Typically dynamic transforms; do not cache. 
+    ============================================================================
+  */
+  if (bereq.backend == nextjs && bereq.url ~ "^/_next/image") {
+    set beresp.ttl = 0s; set beresp.uncacheable = true; return (deliver);
+  }
+
+  /* 
+    ============================================================================
+    PUBLIC HTML: cacheable Next.js pages
+     Only cache HTML we explicitly marked as safe in vcl_recv. 
+    ============================================================================
+  */
+  if (bereq.backend == nextjs
+      && beresp.http.Content-Type ~ "text/html"
+      && bereq.http.X-HTML-Cacheable == "1") {
+
+    /* Drop cookies & keep Vary lean (shared-cache friendliness) */
+    unset beresp.http.Set-Cookie;
+    if (beresp.http.Vary) {
+      set beresp.http.Vary = regsuball(beresp.http.Vary, "(?i)(^|,\\s*)cookie(,\\s*|$)", "\1");
+      if (beresp.http.Vary ~ "^(\\s*,\\s*)+$" || beresp.http.Vary ~ "^\\s*$") { unset beresp.http.Vary; }
+    }
+
+    /* Guard: if CSP carries nonces, don’t cache (nonces change per request). */
+    if (beresp.http.Content-Security-Policy ~ "nonce-") {
+      set beresp.ttl = 0s; set beresp.uncacheable = true; return (deliver);
+    }
+
+    /* Final TTLs for cached HTML (balance freshness with performance) */
+    set beresp.ttl   = 5m;
+    set beresp.grace = 10m;
+    set beresp.keep  = 1h;
+    set beresp.http.Cache-Control = "public, max-age=300";
+    return (deliver);
+  }
+
+  /* 
+    ============================================================================
+    Next HTML (default): never cache
+    Anything not in whitelist is treated as dynamic. 
+    ============================================================================   
+  */
+  if (bereq.backend == nextjs && beresp.http.Content-Type ~ "text/html") {
+    set beresp.ttl = 0s; set beresp.uncacheable = true; return (deliver);
+  }
+
+  /* 
+    ============================================================================
+    Drupal public files
+    Images/PDFs from Drupal public path with tuned TTLs. 
+    ============================================================================  
+  */
+  if (bereq.backend == drupal && bereq.url ~ "^/sites/default/files/") {
+    set beresp.http.Vary = "Accept-Encoding";
+
+    if (beresp.http.Cache-Control ~ "(?i)(no-store|private)") { set beresp.ttl = 0s; return (deliver); }
+    if (bereq.url ~ "(?i)\\.pdf(?:\\?.*)?$") {
+      set beresp.ttl = 14d; set beresp.http.Cache-Control = "public, max-age=1209600";
+      set beresp.do_stream = false; set beresp.do_gzip = false;
+      set beresp.http.Accept-Ranges = "bytes";
+    } else {
+      set beresp.ttl = 30d; set beresp.http.Cache-Control = "public, max-age=2592000";
+      set beresp.do_stream = true; set beresp.do_gzip = false;
+    }
+    set beresp.grace = 4h; set beresp.keep = 72h;
+    unset beresp.http.Set-Cookie;
+    return (deliver);
+  }
+
+  /* 
+    ============================================================================
+    Drupal core/theme/module assets
+    Reasonable TTLs by filetype.
+    ============================================================================
+  */
+  if (bereq.backend == drupal &&
+      bereq.url ~ "^/(core|modules|profiles|themes)/" &&
+      bereq.url ~ "(?i)\\.(?:css|js|map|png|jpe?g|gif|webp|svg|ico|avif|woff2?|ttf|eot|pdf|txt|xml)(?:\\?.*)?$") {
+
+    if (beresp.http.Cache-Control ~ "(?i)(no-store|private)") { set beresp.ttl = 0s; return (deliver); }
+
+    if      (bereq.url ~ "(?i)\\.(?:css|js|map)$")  { set beresp.ttl = 7d;  set beresp.http.Cache-Control = "public, max-age=604800"; set beresp.do_gzip = true;  set beresp.do_stream = true; }
+    else if (bereq.url ~ "(?i)\\.(?:woff2?|ttf|eot)$"){ set beresp.ttl = 30d; set beresp.http.Cache-Control = "public, max-age=2592000"; set beresp.do_stream = true; set beresp.do_gzip = false; }
+    else if (bereq.url ~ "(?i)\\.(?:png|jpe?g|gif|webp|svg|ico|avif)$"){
+      set beresp.ttl = 30d; set beresp.http.Cache-Control = "public, max-age=2592000"; set beresp.do_stream = true; set beresp.do_gzip = false;
+    } else {
+      set beresp.ttl = 1h;  set beresp.http.Cache-Control = "public, max-age=3600";
+    }
+
+    unset beresp.http.Set-Cookie;
+    return (deliver);
+  }
+
+  /* 
+    ============================================================================
+    Safety: generic HTML never cached
+    Explicit opt-in only via whitelist. 
+    ============================================================================   
+  */
+  if (beresp.http.Content-Type ~ "text/html") {
+    set beresp.ttl = 0s; set beresp.uncacheable = true;
+  }
+
+  if (!beresp.http.Cache-Control) { set beresp.http.Cache-Control = "public, max-age=3600"; }
+
+  /* 
+    ============================================================================
+    strip out headers for Security 
+    ============================================================================
+  */
+  unset beresp.http.Server;
+  unset beresp.http.X-Powered-By;
+  unset beresp.http.X-Generator;
+  unset beresp.http.Via;
+  unset beresp.http.X-Drupal-Cache;
+  unset beresp.http.X-Nextjs-Cache;
+}
+
+/* 
+  ============================================================================
+  DELIVERY MARKERS (for debugging in headers)
+  ============================================================================ 
+*/
+sub vcl_hit  { set req.http.X-Cache = "HIT"; }
+sub vcl_miss { set req.http.X-Cache = "MISS"; }
+sub vcl_pass { set req.http.X-Cache = "PASS"; }
+
+/* 
+  ============================================================================
+  SYNTHETIC RESPONSES
+  ============================================================================ 
+*/
+sub vcl_synth {
+  set resp.http.X-Cache = "SYNTH";
+  if (req.url == "/healthz" && resp.status == 200) {
+    set resp.http.Cache-Control = "no-store";
+    set resp.http.Content-Type  = "text/plain; charset=utf-8";
+    synthetic("OK\n");
+    return (deliver);
+  }
+}
+
+/* 
+  ============================================================================
+  DELIVERY ADJUSTMENTS
+  Stamp helpful debug headers (X-Cache, X-Backend).
+  ============================================================================ 
+*/
+sub vcl_deliver {
+  if (req.http.X-Cache) { set resp.http.X-Cache = req.http.X-Cache; }
+  else { set resp.http.X-Cache = "MISS"; }
+
+  if (resp.http.X-Cache == "HIT") {
+    set resp.http.X-Cache-Hits = obj.hits;
+  }
+
+  /* Extra GraphQL visibility (optional diagnostics) */
+  if (req.http.X-Path ~ "^/graphql/?$" || req.url ~ "^/graphql(?:\\?|$)") {
+    if (resp.http.X-Cache == "HIT") { set resp.http.X-GraphQL-Cache = "HIT"; }
+    else { set resp.http.X-GraphQL-Cache = "MISS"; }
+    if (req.http.X-Why-Pass) { set resp.http.X-Why-Pass = req.http.X-Why-Pass; }
+    if (req.http.X-GraphQL-Cacheable) { set resp.http.X-GraphQL-Cacheable = req.http.X-GraphQL-Cacheable; }
+  }
+
+  set resp.http.X-Backend = req.backend_hint;
+
+  if (req.http.X-Forwarded-Proto == "https") {
+    set resp.http.Strict-Transport-Security = "max-age=31536000; includeSubDomains; preload";
+  }
+
+  if (req.http.X-OAuth-Routed) {
+    set resp.http.X-OAuth-Routed = req.http.X-OAuth-Routed;
+  }
+  /* Strip headers for security */
+  unset resp.http.Server;
+  unset resp.http.X-Backend;
+  unset resp.http.X-Cache;
+  unset resp.http.X-Cache-Hits;
+  unset resp.http.X-GraphQL-Cacheable;
+  unset resp.http.X-GraphQL-Cache;
+  unset resp.http.X-Generator;
+  unset resp.http.X-OAuth-Routed;
+  unset resp.http.X-Origin-Backend;
+  unset resp.http.X-Powered-By;
+  unset resp.http.X-Served-By;
+  unset resp.http.Via;
+  unset resp.http.X-Varnish;
+  unset resp.http.X-Why-Pass;
+}
+
+/* 
+  ============================================================================
+  BACKEND ERROR DEBUG
+  Surface context when a backend fetch fails (503s, timeouts, etc.)
+  ============================================================================ 
+*/
+sub vcl_backend_error {
+  set beresp.ttl = 0s;
+  set beresp.uncacheable = true;
+  set beresp.http.Cache-Control = "no-store";
+
+  /* 
+    ============================================================================
+    Strip headers for security 
+    ============================================================================
+  */
+  unset beresp.http.Server;
+  unset beresp.http.X-Backend;
+  unset beresp.http.X-Bereq-Host;
+  unset beresp.http.X-Bereq-URL;
+  unset beresp.http.X-Error-Status;
+  unset beresp.http.X-Error-Reason;
+
+  synthetic({"Service temporarily unavailable."});
+  return (deliver);
+}

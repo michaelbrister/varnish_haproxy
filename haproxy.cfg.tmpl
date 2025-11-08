@@ -1,0 +1,107 @@
+global
+  daemon
+  maxconn 2000
+  log stdout format raw local0
+  log-tag haproxy
+  stats socket /var/run/haproxy.sock mode 600 level admin expose-fd listeners
+
+defaults
+  mode http
+  log  global
+  option httplog
+  option dontlognull
+  option forwardfor header X-Forwarded-For if-none
+  option http-keep-alive
+  option http-buffer-request
+  timeout http-keep-alive  10s
+  timeout connect          5s
+  timeout client           60s
+  timeout server           120s
+  timeout queue            30s
+  retries                  2
+
+userlist require_basic_auth
+  user admin insecure-password password
+  # For prod use: user ${BASIC_USER:-admin} password ${BASIC_PASS_HASH}
+
+listen stats
+  bind 127.0.0.1:8404
+  stats enable
+  stats uri /haproxy?stats
+  stats refresh 10s
+  stats hide-version
+
+frontend origin_router
+  bind 127.0.0.1:8081
+
+  # --- Canonical proxy headers ---
+  http-request set-header X-Forwarded-Proto https unless { req.hdr(X-Forwarded-Proto) -m found }
+  http-request set-header X-Forwarded-Port  443      unless { req.hdr(X-Forwarded-Port)  -m found }
+
+  # Prefer X-Forwarded-Host; else Origin; else Host
+  http-request set-var(txn.orig_host) req.hdr(X-Forwarded-Host) if { req.hdr(X-Forwarded-Host) -m found }
+  http-request set-var(txn.orig_host) req.hdr(Origin),field(3,/),field(1,:) if !{ var(txn.orig_host) -m found } { req.hdr(Origin) -m found }
+  http-request set-var(txn.orig_host) req.hdr(Host) if !{ var(txn.orig_host) -m found }
+  http-request set-header X-Forwarded-Host %[var(txn.orig_host)]
+
+  # Normalize accidental double slashes
+  http-request replace-path ^/{2,}(.*)$ /\1
+
+  # Env/feature flags
+  http-request set-var(txn.app_env)            str(${APP_ENV})
+  http-request set-var(txn.basic_auth_enabled) str(${BASIC_AUTH_ENABLED:-})
+
+  # --- ACLs ---
+  acl is_sitemap     path -i -m str /sitemap.xml
+  acl is_oauth       path -i -m beg /oauth/token /oauth/token/
+  acl is_graphql     path -i -m beg /graphql /graphql/
+  acl drupal_admin   path -i -m beg /user /admin
+  acl drupal_assets  path -i -m beg /sites/default/files /core /modules /profiles /themes
+
+  # Hosts (using txn.orig_host; requires -m)
+  acl host_is_next    var(txn.orig_host) -m reg -i ^dev\.example\.com$
+  acl host_is_drupal  var(txn.orig_host) -m reg -i ^cdn-dev\.example\.com$
+
+  # Basic Auth controls
+  acl env_needs_auth  var(txn.app_env) -m reg -i ^(dev|staging)$
+  acl auth_forced     var(txn.basic_auth_enabled) -m str 1
+  acl basic_auth_ok   http_auth(require_basic_auth)
+  acl auth_required   or auth_forced env_needs_auth
+
+  # Require Basic Auth for BOTH hosts, except for /sitemap.xml
+  http-request auth realm "Restricted" if !is_sitemap auth_required !basic_auth_ok
+
+  # --- Routing ---
+  # Route sitemaps to their respective backends
+  use_backend be_drupal if host_is_drupal is_sitemap
+  use_backend be_next   if host_is_next   is_sitemap
+
+  # Regular routing
+  use_backend be_drupal if is_oauth || is_graphql || drupal_admin || drupal_assets
+  use_backend be_drupal if host_is_drupal
+  use_backend be_next   if host_is_next
+
+  default_backend be_next
+
+backend be_drupal
+  option http-keep-alive
+  http-reuse always
+
+  # Azure virtual-host routing
+  http-request set-header Host ${BACKEND_HOST}
+
+  server drupal ${BACKEND_HOST}:443 ssl verify none sni str(${BACKEND_HOST}) alpn h2,http/1.1 proto h2 check maxconn 500 slowstart 3s
+  http-response set-header X-Origin-Backend drupal
+
+  # Optional overload guard: if >400 conns to this srv, 503 quickly instead of queueing forever
+  # http-request deny if { srv_conn(drupal) gt 400 }
+
+backend be_next
+  option http-keep-alive
+  http-reuse always
+
+  # Azure virtual-host routing
+  http-request set-header Host ${NEXT_HOST}
+
+  server next ${NEXT_HOST}:443 ssl verify none sni str(${NEXT_HOST}) alpn h2,http/1.1 proto h2 check maxconn 500 slowstart 3s
+  http-response set-header X-Origin-Backend nextjs
