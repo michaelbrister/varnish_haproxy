@@ -43,6 +43,13 @@ acl purge {
 */
 sub vcl_recv {
 
+  # ========= GLOBAL BYPASS WHEN AUTH IS REQUIRED =========
+  # Mirror your HAProxy condition: BASIC_AUTH_ENABLED=1 OR APP_ENV in {dev, staging}
+  if (std.getenv("BASIC_AUTH_ENABLED") == "1"
+      || std.getenv("APP_ENV") ~ "(?i)^(dev|staging)$") {
+    return (pass);
+  }
+
   if (req.http.Host) {
     set req.http.Host = std.tolower(req.http.Host);
     if (req.http.Host ~ ":[0-9]+$") {
@@ -426,6 +433,16 @@ sub vcl_backend_fetch {
   ============================================================================ 
 */
 sub vcl_backend_response {
+  
+  /* --------------------------------------------------------------------------
+     PATCH: If basic auth is enabled, turn off caching
+  -------------------------------------------------------------------------- */
+  if (std.getenv("BASIC_AUTH_ENABLED") == "1"
+      || std.getenv("APP_ENV") ~ "(?i)^(dev|staging)$") {
+    set beresp.ttl = 0s;
+    set beresp.uncacheable = true;
+    return (deliver);
+  }
 
   /* --------------------------------------------------------------------------
      PATCH: shared safety net and SWR-like behavior
