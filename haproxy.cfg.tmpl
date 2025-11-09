@@ -44,9 +44,6 @@ frontend origin_router
   http-request set-var(txn.orig_host) req.hdr(Host) if !{ var(txn.orig_host) -m found }
   http-request set-header X-Forwarded-Host %[var(txn.orig_host)]
 
-  # If auth is required, tag requests so an upstream Varnish (if present) can bypass cache
-  http-request set-header X-Bypass-Cache 1 if auth_required
-
   # Normalize accidental double slashes
   http-request replace-path ^/{2,}(.*)$ /\1
 
@@ -74,16 +71,13 @@ frontend origin_router
   # Require Basic Auth for BOTH hosts, except for /sitemap.xml
   http-request auth realm "Restricted" if !is_sitemap auth_required !basic_auth_ok
 
-
-  # advertise bypass to any upstream cache
+  # If auth is required, tag requests so an upstream cache (if present) can bypass
   http-request set-header X-Bypass-Cache 1 if auth_required
 
   # --- Routing ---
-  # Route sitemaps to their respective backends
   use_backend be_drupal if host_is_drupal is_sitemap
   use_backend be_next   if host_is_next   is_sitemap
 
-  # Regular routing
   use_backend be_drupal if is_oauth || is_graphql || drupal_admin || drupal_assets
   use_backend be_drupal if host_is_drupal
   use_backend be_next   if host_is_next
