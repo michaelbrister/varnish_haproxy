@@ -452,8 +452,22 @@ sub vcl_backend_response {
     set beresp.grace = 10m;
     set beresp.keep  = 30m;
   }
-  if (beresp.status == 404) { set beresp.ttl = 5m; }
-  if (beresp.status == 301 || beresp.status == 302 || beresp.status == 308) { set beresp.ttl = 10m; }
+  if (beresp.status == 404 || beresp.status == 410) { 
+    unset beresp.http.Set-Cookie;
+    set beresp.ttl   = 5m; 
+    set beresp.grace = 10m;
+    set beresp.keep  = 15m;
+    set beresp.http.Cache-Control = "public, max-age=600";
+    return (deliver);
+}
+  if (beresp.status == 301 || beresp.status == 302 || beresp.status == 308) {
+    unset beresp.http.Set-Cookie;
+    set beresp.ttl   = 10m;
+    set beresp.grace = 20m;
+    set beresp.keep  = 30m;
+    set beresp.http.Cache-Control = "public, max-age=600";
+    return (deliver);
+  }
   if (beresp.status >= 500) { set beresp.ttl = 1s; set beresp.grace = 15m; }
 
   /* Strip Imperva Set-Cookie on cacheable HTML (anon/public pages) */
